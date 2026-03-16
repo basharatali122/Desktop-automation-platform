@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Milkyway  superRoulette</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    />
+  </head>
+  <body>
+    <!-- Registration Modal -->
+    <div id="registrationModal" class="modal-overlay" style="display: none">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2><i class="fas fa-user-plus"></i>  Registration</h2>
+          <p>Register to start using the application</p>
+        </div>
+
+        <div class="modal-body">
+          <form id="registrationForm">
+            <div class="form-group">
+              <label><i class="fas fa-envelope"></i> Email Address</label>
+              <input
+                type="email"
+                id="regEmail"
+                required
+                placeholder="your@email.com"
+              />
+              <small>Each email can only be used from one device/IP</small>
+            </div>
+
+            <div class="form-group">
+              <label><i class="fas fa-lock"></i> Password</label>
+              <input
+                type="password"
+                id="regPassword"
+                required
+                placeholder="Create password"
+              />
+            </div>
+
+            <div class="form-group">
+              <label><i class="fas fa-lock"></i> Confirm Password</label>
+              <input
+                type="password"
+                id="regConfirmPassword"
+                required
+                placeholder="Confirm password"
+              />
+            </div>
+
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">
+                <i class="fas fa-user-check"></i> Register & Request Approval
+              </button>
+            </div>
+          </form>
+
+          <div class="login-toggle">
+            <p>
+              Already registered?
+              <a href="#" id="showLogin"
+                ><i class="fas fa-sign-in-alt"></i> Login here</a
+              >
+            </p>
+          </div>
+
+          <!-- Login Form (hidden by default) -->
+          <form id="loginForm" style="display: none">
+            <div class="form-group">
+              <label><i class="fas fa-envelope"></i> Email</label>
+              <input type="email" id="loginEmail" required />
+            </div>
+
+            <div class="form-group">
+              <label><i class="fas fa-lock"></i> Password</label>
+              <input type="password" id="loginPassword" required />
+            </div>
+
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">
+                <i class="fas fa-sign-in-alt"></i> Login
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Pending Approval Modal -->
+    <div id="pendingApprovalModal" class="modal-overlay" style="display: none">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2><i class="fas fa-clock"></i> Pending Approval</h2>
+        </div>
+
+        <div class="modal-body">
+          <div class="pending-content">
+            <div class="loading-spinner"></div>
+            <p>Your registration is pending admin approval.</p>
+            <p>You will be automatically notified once approved.</p>
+            <button id="checkApprovalStatus" class="btn btn-secondary">
+              <i class="fas fa-sync-alt"></i> Check Status
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Application Container -->
+    <div class="app-container">
+      <!-- Enhanced Header -->
+      <!-- <header class="app-header">
+        <div class="header-content">
+          <div class="header-brand">
+            <div class="logo">
+              <i class="fas fa-fire"></i>
+            </div>
+            <div class="brand-text">
+              <h1> FireKirin superRoulette</h1>
+              <p class="tagline">Onjoo mayo </p>
+            </div>
+          </div>
+
+          <div class="header-stats">
+            <div class="stat-badge">
+              <i class="fas fa-users"></i>
+              <span>Accounts: <strong id="totalAccounts">0</strong></span>
+            </div>
+            <div class="stat-badge success">
+              <i class="fas fa-check-circle"></i>
+              <span>Success: <strong id="successCount">0</strong></span>
+            </div>
+            <div class="stat-badge error">
+              <i class="fas fa-times-circle"></i>
+              <span>Failed: <strong id="failCount">0</strong></span>
+            </div>
+            <div class="stat-badge warning">
+              <i class="fas fa-redo-alt"></i>
+              <span>Cycles: <strong id="cycleCount">0/0</strong></span>
+            </div>
+          </div>
+
+          <div class="user-status-bar">
+            <div class="user-info">
+              <i class="fas fa-user-circle"></i>
+              <span class="user-email">Not Logged In</span>
+            </div>
+            <div class="user-status pending">Pending</div>
+            <div class="license-expiry">License: N/A</div>
+          </div>
+        </div>
+      </header> -->
+
+
+      <!-- Enhanced Header -->
+<header class="app-header">
+  <div class="header-content">
+    
+    <!-- Brand -->
+    <div class="header-brand">
+      <div class="logo">
+        <i class="fas fa-fire"></i>
+      </div>
+      <div class="brand-text">
+        <h1>Milkyway superRoulette</h1>
+        <p class="tagline">Onjoo mayo</p>
+      </div>
+    </div>
+
+    <!-- Dashboard Title -->
+    <div class="header-dashboard-title">
+      <h2>ONJO-MW AI DASHBOARD</h2>
+    </div>
+
+    <!-- Hidden Stats (kept for JS logic so no errors occur) -->
+    <div class="header-stats" style="display: none">
+      <div class="stat-badge">
+        <i class="fas fa-users"></i>
+        <span>Accounts: <strong id="totalAccounts">0</strong></span>
+      </div>
+
+      <div class="stat-badge success">
+        <i class="fas fa-check-circle"></i>
+        <span>Success: <strong id="successCount">0</strong></span>
+      </div>
+
+      <div class="stat-badge error">
+        <i class="fas fa-times-circle"></i>
+        <span>Failed: <strong id="failCount">0</strong></span>
+      </div>
+
+      <div class="stat-badge warning">
+        <i class="fas fa-redo-alt"></i>
+        <span>Cycles: <strong id="cycleCount">0/0</strong></span>
+      </div>
+    </div>
+
+    <!-- User Status -->
+    <div class="user-status-bar">
+      <div class="user-info">
+        <i class="fas fa-user-circle"></i>
+        <span class="user-email">Not Logged In</span>
+      </div>
+      <div class="user-status pending">Pending</div>
+      <div class="license-expiry">License: N/A</div>
+    </div>
+
+  </div>
+</header>
+
+
+      <!-- Main Content -->
+      <div class="main-content">
+        <!-- Enhanced Sidebar -->
+        <div class="sidebar">
+          <div class="sidebar-content">
+            <!-- Account Generator Section -->
+            <div class="section">
+              <div class="section-header">
+                <h3><i class="fas fa-user-plus"></i> Account Generator</h3>
+              </div>
+              <div class="compact-form">
+                <div class="form-row">
+                  <div class="form-group compact">
+                    <label><i class="fas fa-tag"></i> Prefix</label>
+                    <input
+                      type="text"
+                      id="bulkPrefix"
+                      class="form-input"
+                      value="user"
+                      placeholder="prefix"
+                    />
+                  </div>
+                  <div class="form-group compact">
+                    <label><i class="fas fa-play"></i> Start #</label>
+                    <input
+                      type="number"
+                      id="startRange"
+                      class="form-input"
+                      value="1"
+                      min="1"
+                    />
+                  </div>
+                  <div class="form-group compact">
+                    <label><i class="fas fa-stop"></i> End #</label>
+                    <input
+                      type="number"
+                      id="endRange"
+                      class="form-input"
+                      value="10"
+                      min="1"
+                    />
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label><i class="fas fa-key"></i> Password</label>
+                  <input
+                    type="password"
+                    id="bulkPassword"
+                    class="form-input"
+                    placeholder="Password"
+                    required
+                  />
+                </div>
+                <div class="form-group">
+                  <label><i class="fas fa-star"></i> Initial Score</label>
+                  <input
+                    type="number"
+                    id="bulkScore"
+                    class="form-input"
+                    value="0"
+                    min="0"
+                    placeholder="Initial Score"
+                  />
+                </div>
+                <button
+                  id="generateAccounts"
+                  class="btn btn-primary full-width"
+                >
+                  <i class="fas fa-bolt"></i> Generate Accounts
+                </button>
+                <div class="form-preview">
+                  <small
+                    >Will create:
+                    <span id="totalAccountsPreview">10</span> accounts</small
+                  >
+                </div>
+              </div>
+            </div>
+
+            <!-- Account Management Section -->
+            <div class="section">
+              <div class="section-header">
+                <h3><i class="fas fa-cogs"></i> Account Management</h3>
+              </div>
+              <div class="control-panel">
+                <div class="danger-zone">
+                  <p class="danger-text">
+                    <i class="fas fa-exclamation-triangle"></i> Danger Zone
+                  </p>
+                  <button
+                    id="deleteAllAccounts"
+                    class="btn btn-danger full-width"
+                  >
+                    <i class="fas fa-trash-alt"></i> Delete All Accounts
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Processing Control Section -->
+            <div class="section">
+              <div class="section-header">
+                <h3><i class="fas fa-sliders-h"></i> Control Panel</h3>
+              </div>
+              <div class="control-panel">
+                <!-- Repetition Settings -->
+                <div class="repetition-settings">
+                  <div class="form-group">
+                    <label
+                      ><i class="fas fa-redo-alt"></i> Processing Cycles</label
+                    >
+                    <input
+                      type="number"
+                      id="repetitionCount"
+                      class="form-input"
+                      value="1"
+                      min="1"
+                      max="100"
+                      placeholder="How many times to process?"
+                    />
+                  </div>
+                </div>
+
+                <!-- Control Buttons -->
+                <div class="control-main">
+                  <button
+                    id="startProcessing"
+                    class="btn btn-success full-width"
+                  >
+                    <i class="fas fa-play-circle"></i> Start Processing
+                  </button>
+                  <button
+                    id="stopProcessing"
+                    class="btn btn-danger full-width"
+                    disabled
+                  >
+                    <i class="fas fa-stop-circle"></i> Stop Processing
+                  </button>
+                </div>
+
+                <!-- Status Display -->
+                <div class="control-status">
+                  <div class="status-item">
+                    <span class="status-label"
+                      ><i class="fas fa-info-circle"></i> Status:</span
+                    >
+                    <span id="processingStatus" class="status-value"
+                      >Ready</span
+                    >
+                  </div>
+                  <div class="status-item">
+                    <span class="status-label"
+                      ><i class="fas fa-tasks"></i> Progress:</span
+                    >
+                    <span id="progressInfo" class="status-value">0/0</span>
+                  </div>
+                  <div class="status-item">
+                    <span class="status-label"
+                      ><i class="fas fa-sync-alt"></i> Current Cycle:</span
+                    >
+                    <span id="currentCycle" class="status-value">0/0</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Anti-Detection Features Section -->
+            
+
+           
+           
+          </div>
+        </div>
+
+        <!-- Enhanced Content Area -->
+        <div class="content-area">
+          <!-- Terminal Output Section -->
+          <div class="terminal-section">
+            <div class="terminal-header">
+              <div class="terminal-title">
+                <h3><i class="fas fa-terminal"></i> Execution Terminal</h3>
+                <div class="terminal-badges">
+                  <span class="badge info"
+                    ><i class="fas fa-user-clock"></i> Active:
+                    <span id="activeWorkers">0</span></span
+                  >
+                  <span class="badge success"
+                    ><i class="fas fa-percentage"></i> Success:
+                    <span id="successRate">0%</span></span
+                  >
+                  <span class="badge warning"
+                    ><i class="fas fa-redo-alt"></i> Cycle:
+                    <span id="cycleProgress">0/0</span></span
+                  >
+                </div>
+              </div>
+              <div class="terminal-actions">
+                <button id="clearTerminal" class="btn btn-small btn-outline">
+                  <i class="fas fa-broom"></i> Clear
+                </button>
+                <button id="exportLogs" class="btn btn-small btn-outline">
+                  <i class="fas fa-download"></i> Export
+                </button>
+                <label class="auto-scroll">
+                  <input type="checkbox" id="autoScroll" checked />
+                  <i class="fas fa-arrows-alt-v"></i> Auto Scroll
+                </label>
+              </div>
+            </div>
+            <div class="terminal" id="terminalOutput">
+              <div class="terminal-line info">
+                <i class="fas fa-rocket"></i> Milkyway Automation Started
+              </div>
+              <div class="terminal-line info">
+                <i class="fas fa-lightbulb"></i> Ready to process accounts
+              </div>
+            </div>
+          </div>
+
+          <!-- Real-time Statistics -->
+          <div class="stats-grid">
+            <div class="stat-item">
+              <div class="stat-icon">
+                <i class="fas fa-chart-line"></i>
+              </div>
+              <div class="stat-data">
+                <div class="stat-number" id="totalProcessed">0</div>
+                <div class="stat-label">Total Processed</div>
+              </div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-icon">
+                <i class="fas fa-check-circle"></i>
+              </div>
+              <div class="stat-data">
+                <div class="stat-number success" id="successfulCount">0</div>
+                <div class="stat-label">Successful</div>
+              </div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-icon">
+                <i class="fas fa-times-circle"></i>
+              </div>
+              <div class="stat-data">
+                <div class="stat-number error" id="failedCount">0</div>
+                <div class="stat-label">Failed</div>
+              </div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-icon">
+                <i class="fas fa-sync-alt"></i>
+              </div>
+              <div class="stat-data">
+                <div class="stat-number warning" id="cyclesCompleted">0</div>
+                <div class="stat-label">Cycles Done</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
