@@ -840,8 +840,6 @@
 
 //version 2.0.1 - Ultimate Roulette Processor with Enhanced Security, Adaptive Backoff, and Realistic Behavior
 
-
-
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const { SocksProxyAgent } = require('socks-proxy-agent');
@@ -855,77 +853,86 @@ class UltimateRouletteProcessor extends EventEmitter {
     this.currentAccounts = [];
     this.activeProcesses = new Map();
     this.connectionPool = new Map();
-    
     this.activeIntervals = new Set();
     this.activeTimeouts = new Set();
-    
+
+    // Set by main.js after construction
+    this.instanceId = 'default';
+    this.globalCoordinator = null;  // GlobalSocketCoordinator from main.js
+
     this.config = {
       LOGIN_WS_URL: 'wss://game.milkywayapp.xyz:7878/',
       SUPER_ROULETTE_WS_URL: 'wss://game.milkywayapp.xyz:10152/',
       GAME_VERSION: '2.0.1',
 
-      CONCURRENT_WORKERS: 15,
-      BATCH_SIZE: 10,
-      ACCOUNTS_PER_MINUTE: 80,
-      
+      CONCURRENT_WORKERS: 10,
+
+      // BATCH_SIZE: 4 per profile.
+      // Server allows ~16 total simultaneous connections from one IP before
+      // blocking it for 60-90s. With 4 profiles × 4 = 16, we stay right at
+      // the limit. GlobalSocketCoordinator hard-caps the total at 14 across
+      // all profiles as a safety margin.
+      BATCH_SIZE: 4,
+
+      ACCOUNTS_PER_MINUTE: 60,
+
       COMPLETE_RESET_BETWEEN_CYCLES: true,
       MAX_CONNECTIONS_PER_CYCLE: 100,
-      
-      BATCH_DELAY_MS: 500,
+
+      // 400ms between batches — with 4 accounts/batch taking ~8s each,
+      // effective rate is ~25-30 per profile per minute. 4 profiles = ~60/min total
+      // across all profiles without triggering the server block.
+      BATCH_DELAY_MS: 400,
       RETRY_ATTEMPTS: 0,
 
       RANDOM_DELAYS: {
-        MIN: 100,
-        MAX: 300
+        MIN: 150,
+        MAX: 400
       },
       CYCLE_DELAY: {
         MIN: 500,
         MAX: 1000
       },
-      
+
       TIMEOUTS: {
         LOGIN: 22000,
         GAME_CONNECTION: 8000,
         ENTER_GAME: 8000,
         JOIN_GAME: 8000,
-        BET_RESPONSE: 10000,
+        BET_RESPONSE: 8000,
         GAME_READY: 10000
       },
 
-      BATCH_STAGGER_MS: 150,
+      // 200ms stagger × 4 = 800ms total spread per batch.
+      BATCH_STAGGER_MS: 200,
     };
 
-    // FIX 8: Adaptive backoff state for multi-machine slowdown.
-    // When 5+ computers hit the same server simultaneously, the server
-    // rate-limits connections. The old code had a fixed ACCOUNTS_PER_MINUTE
-    // cap that was purely local and didn't react to server-side slowdown.
-    // This adaptive system detects slow login times and automatically
-    // increases the stagger and batch delay to reduce server pressure,
-    // then recovers when things speed up again.
+    // Adaptive backoff state
     this.adaptiveState = {
-      recentLoginTimes: [],       // Rolling window of last 20 login durations
-      maxRecentSamples: 20,
+      recentLoginTimes: [],
+      maxRecentSamples: 8,
       currentStaggerMs: this.config.BATCH_STAGGER_MS,
       currentBatchDelayMs: this.config.BATCH_DELAY_MS,
-      
-      // Thresholds: if average login > SLOW_THRESHOLD, back off
-      SLOW_THRESHOLD_MS: 8000,   // Login taking >8s = server is under pressure
-      FAST_THRESHOLD_MS: 4000,   // Login taking <4s = server is comfortable
-      
-      // Backoff limits
-      MAX_STAGGER_MS: 500,       // Max 500ms per slot (5s for 10-slot batch)
-      MIN_STAGGER_MS: 100,       // Min 100ms per slot
-      MAX_BATCH_DELAY_MS: 3000,  // Max 3s between batches
-      MIN_BATCH_DELAY_MS: 300,   // Min 300ms between batches
-      
-      // Backoff step sizes
-      BACKOFF_STEP: 50,          // Add 50ms stagger when slowing down
-      RECOVER_STEP: 20,          // Remove 20ms stagger when recovering
-      consecutiveSlowBatches: 0, // Track how many slow batches in a row
+      SLOW_THRESHOLD_MS: 8000,   // Back off when avg login > 8s
+      FAST_THRESHOLD_MS: 4500,   // Recover when avg login < 4.5s
+      MAX_STAGGER_MS: 400,
+      MIN_STAGGER_MS: 150,
+      MAX_BATCH_DELAY_MS: 1500,
+      MIN_BATCH_DELAY_MS: 300,
+      BACKOFF_STEP: 50,
+      RECOVER_STEP: 75,
+      consecutiveSlowBatches: 0,
+
+      // IP-block detection: when all recent logins hit the full 22s timeout,
+      // the server has blocked this IP. Trigger a mandatory cooldown.
+      IP_BLOCK_THRESHOLD_MS: 20000,  // Login avg this high = server blocked us
+      IP_BLOCK_COOLDOWN_MS: 75000,   // Wait 75s before trying again
+      isIPBlocked: false,
+      ipBlockedAt: 0,
     };
 
     this.cycleState = this.createFreshCycleState();
-    
+
     this.betConfig = {
       totalBet: 20,
       isDynamic: false,
@@ -943,55 +950,99 @@ class UltimateRouletteProcessor extends EventEmitter {
     this.cycleStats = this.createFreshCycleStats();
   }
 
-  // FIX 9: Record login time and adjust stagger/delay adaptively.
-  // Called after every login attempt (success or failure) so the system
-  // has a real-time view of server response latency.
+  // ---------------------------------------------------------------------------
+  // Global socket coordinator helpers
+  // ---------------------------------------------------------------------------
+
+  async acquireSocket() {
+    // First acquire from global coordinator (shared across all profiles)
+    const coordinator = this.globalCoordinator || global.GlobalSocketCoordinator;
+    if (coordinator) {
+      await coordinator.acquire();
+    }
+  }
+
+  releaseSocket() {
+    const coordinator = this.globalCoordinator || global.GlobalSocketCoordinator;
+    if (coordinator) {
+      coordinator.release();
+    }
+  }
+
+  getGlobalSocketCount() {
+    const coordinator = this.globalCoordinator || global.GlobalSocketCoordinator;
+    return coordinator ? coordinator.getCount() : this.connectionPool.size;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Adaptive backoff
+  // ---------------------------------------------------------------------------
+
   recordLoginTime(loginTimeMs) {
     const state = this.adaptiveState;
     state.recentLoginTimes.push(loginTimeMs);
-    if (state.recentLoginTimes.length > state.maxRecentSamples) {
-      state.recentLoginTimes.shift();
-    }
-
-    // Only adapt once we have enough samples
-    if (state.recentLoginTimes.length < 5) return;
+    if (state.recentLoginTimes.length > state.maxRecentSamples) state.recentLoginTimes.shift();
+    if (state.recentLoginTimes.length < 3) return;
 
     const avg = state.recentLoginTimes.reduce((a, b) => a + b, 0) / state.recentLoginTimes.length;
 
-    if (avg > state.SLOW_THRESHOLD_MS) {
-      // Server is under pressure — back off
-      state.consecutiveSlowBatches++;
-      state.currentStaggerMs = Math.min(
-        state.MAX_STAGGER_MS,
-        state.currentStaggerMs + state.BACKOFF_STEP
-      );
-      state.currentBatchDelayMs = Math.min(
-        state.MAX_BATCH_DELAY_MS,
-        state.currentBatchDelayMs + (state.BACKOFF_STEP * 2)
-      );
-      
-      if (state.consecutiveSlowBatches % 3 === 0) {
-        // Log backoff every 3 consecutive slow batches to avoid spam
+    // IP-block detection: if avg hits the full timeout ceiling, the server
+    // has blocked this IP. Mark blocked — processSingleCycle will cooldown.
+    if (avg >= state.IP_BLOCK_THRESHOLD_MS && !state.isIPBlocked) {
+      state.isIPBlocked = true;
+      state.ipBlockedAt = Date.now();
+      this.emit('terminal', {
+        type: 'error',
+        message: `🚫 [${this.instanceId}] IP RATE LIMITED by server! Avg login ${Math.round(avg)}ms. Cooling down ${state.IP_BLOCK_COOLDOWN_MS / 1000}s...`
+      });
+      // Reset rolling window so stale block times don't contaminate recovery
+      state.recentLoginTimes = [];
+      return;
+    }
+
+    // If previously blocked but cooldown has passed, clear block state
+    if (state.isIPBlocked) {
+      if (Date.now() - state.ipBlockedAt >= state.IP_BLOCK_COOLDOWN_MS) {
+        state.isIPBlocked = false;
+        state.recentLoginTimes = [];
+        // Reset to conservative defaults after a block
+        state.currentStaggerMs = state.MAX_STAGGER_MS;
+        state.currentBatchDelayMs = state.MAX_BATCH_DELAY_MS;
         this.emit('terminal', {
-          type: 'warning',
-          message: `⚡ Adaptive backoff: avg login ${Math.round(avg)}ms → stagger ${state.currentStaggerMs}ms, delay ${state.currentBatchDelayMs}ms`
+          type: 'info',
+          message: `✅ [${this.instanceId}] IP block cooldown complete. Resuming with conservative settings.`
         });
       }
+      return; // Don't adjust stagger while still blocked
+    }
+
+    const prevStagger = state.currentStaggerMs;
+    const prevDelay = state.currentBatchDelayMs;
+
+    if (avg > state.SLOW_THRESHOLD_MS) {
+      state.consecutiveSlowBatches++;
+      state.currentStaggerMs = Math.min(state.MAX_STAGGER_MS, state.currentStaggerMs + state.BACKOFF_STEP);
+      state.currentBatchDelayMs = Math.min(state.MAX_BATCH_DELAY_MS, state.currentBatchDelayMs + (state.BACKOFF_STEP * 2));
     } else if (avg < state.FAST_THRESHOLD_MS) {
-      // Server is comfortable — recover toward defaults
       state.consecutiveSlowBatches = 0;
-      state.currentStaggerMs = Math.max(
-        state.MIN_STAGGER_MS,
-        state.currentStaggerMs - state.RECOVER_STEP
-      );
-      state.currentBatchDelayMs = Math.max(
-        state.MIN_BATCH_DELAY_MS,
-        state.currentBatchDelayMs - state.RECOVER_STEP
-      );
+      state.currentStaggerMs = Math.max(state.MIN_STAGGER_MS, state.currentStaggerMs - state.RECOVER_STEP);
+      state.currentBatchDelayMs = Math.max(state.MIN_BATCH_DELAY_MS, state.currentBatchDelayMs - (state.RECOVER_STEP * 2));
     } else {
       state.consecutiveSlowBatches = 0;
     }
+
+    if (state.currentStaggerMs !== prevStagger || state.currentBatchDelayMs !== prevDelay) {
+      const direction = state.currentStaggerMs > prevStagger ? '⬆️ Backing off' : '⬇️ Recovering';
+      this.emit('terminal', {
+        type: state.currentStaggerMs > prevStagger ? 'warning' : 'info',
+        message: `⚡ [${this.instanceId}] Adaptive ${direction}: avg login ${Math.round(avg)}ms → stagger ${state.currentStaggerMs}ms, delay ${state.currentBatchDelayMs}ms`
+      });
+    }
   }
+
+  // ---------------------------------------------------------------------------
+  // Cycle state / stats
+  // ---------------------------------------------------------------------------
 
   createFreshCycleState() {
     return {
@@ -1019,30 +1070,24 @@ class UltimateRouletteProcessor extends EventEmitter {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // Bet management
+  // ---------------------------------------------------------------------------
+
   updateBetConfig(newConfig) {
-    if (newConfig) {
-      if (newConfig.totalBet !== undefined) {
-        this.betConfig.totalBet = Math.max(this.betConfig.minBet, Math.min(this.betConfig.maxBet, newConfig.totalBet));
-      }
-      if (newConfig.dynamicAmount !== undefined) {
-        this.betConfig.dynamicAmount = Math.max(this.betConfig.minBet, Math.min(this.betConfig.maxBet, newConfig.dynamicAmount));
-      }
-      if (newConfig.isDynamic !== undefined) this.betConfig.isDynamic = newConfig.isDynamic;
-      if (newConfig.splitBets !== undefined) this.betConfig.splitBets = newConfig.splitBets;
-      if (newConfig.betStrategy !== undefined) this.betConfig.betStrategy = newConfig.betStrategy;
-      
-      this.emit('terminal', { type: 'info', message: `🎯 Bet configuration updated: ${this.getCurrentBetAmount()}` });
-      this.emit('betConfigChanged', {
-        totalBet: this.betConfig.totalBet,
-        dynamicAmount: this.betConfig.dynamicAmount,
-        currentBet: this.getCurrentBetAmount(),
-        isDynamic: this.betConfig.isDynamic,
-        splitBets: this.betConfig.splitBets,
-        betStrategy: this.betConfig.betStrategy
-      });
-      return true;
-    }
-    return false;
+    if (!newConfig) return false;
+    if (newConfig.totalBet !== undefined) this.betConfig.totalBet = Math.max(this.betConfig.minBet, Math.min(this.betConfig.maxBet, newConfig.totalBet));
+    if (newConfig.dynamicAmount !== undefined) this.betConfig.dynamicAmount = Math.max(this.betConfig.minBet, Math.min(this.betConfig.maxBet, newConfig.dynamicAmount));
+    if (newConfig.isDynamic !== undefined) this.betConfig.isDynamic = newConfig.isDynamic;
+    if (newConfig.splitBets !== undefined) this.betConfig.splitBets = newConfig.splitBets;
+    if (newConfig.betStrategy !== undefined) this.betConfig.betStrategy = newConfig.betStrategy;
+    this.emit('terminal', { type: 'info', message: `🎯 Bet configuration updated: ${this.getCurrentBetAmount()}` });
+    this.emit('betConfigChanged', {
+      totalBet: this.betConfig.totalBet, dynamicAmount: this.betConfig.dynamicAmount,
+      currentBet: this.getCurrentBetAmount(), isDynamic: this.betConfig.isDynamic,
+      splitBets: this.betConfig.splitBets, betStrategy: this.betConfig.betStrategy
+    });
+    return true;
   }
 
   getCurrentBetAmount() {
@@ -1053,72 +1098,61 @@ class UltimateRouletteProcessor extends EventEmitter {
   handleBetChange(newAmount) {
     const amount = parseInt(newAmount);
     if (isNaN(amount) || amount < this.betConfig.minBet || amount > this.betConfig.maxBet) {
-      this.emit('betError', { message: `Invalid bet amount: ${newAmount}. Must be between ${this.betConfig.minBet} and ${this.betConfig.maxBet}` });
+      this.emit('betError', { message: `Invalid bet: ${newAmount}. Must be ${this.betConfig.minBet}-${this.betConfig.maxBet}` });
       return false;
     }
-    const oldAmount = this.getCurrentBetAmount();
+    const old = this.getCurrentBetAmount();
     this.updateBetConfig({ isDynamic: true, dynamicAmount: amount });
-    this.emit('terminal', { type: 'success', message: `✅ Bet amount changed: ${oldAmount} → ${amount}` });
+    this.emit('terminal', { type: 'success', message: `✅ Bet changed: ${old} → ${amount}` });
     return true;
   }
 
   resetToDefaultBet() {
     this.updateBetConfig({ isDynamic: false, dynamicAmount: 0 });
-    this.emit('terminal', { type: 'info', message: `🔄 Reset to default bet: ${this.getCurrentBetAmount()}` });
+    this.emit('terminal', { type: 'info', message: `🔄 Bet reset to default: ${this.getCurrentBetAmount()}` });
     return this.getCurrentBetAmount();
   }
 
   getBetConfig() {
-    return {
-      ...this.betConfig,
-      currentBet: this.getCurrentBetAmount(),
-      totalBetsPlaced: this.cycleStats.totalBetAmount,
-      totalWins: this.cycleStats.totalWinAmount
-    };
+    return { ...this.betConfig, currentBet: this.getCurrentBetAmount(), totalBetsPlaced: this.cycleStats.totalBetAmount, totalWins: this.cycleStats.totalWinAmount };
   }
 
   createBetPayload() {
-    const currentBetAmount = this.getCurrentBetAmount();
-    let firstBet = currentBetAmount;
-    let secondBet = currentBetAmount;
-    if (this.betConfig.splitBets && currentBetAmount > 1) {
-      firstBet = Math.floor(currentBetAmount / 2);
-      secondBet = currentBetAmount - firstBet;
-    }
-    this.cycleStats.totalBetAmount += currentBetAmount;
-    this.betConfig.betHistory.push({ amount: currentBetAmount, timestamp: new Date().toISOString(), split: this.betConfig.splitBets, firstBet, secondBet });
+    const amount = this.getCurrentBetAmount();
+    let firstBet = amount, secondBet = amount;
+    if (this.betConfig.splitBets && amount > 1) { firstBet = Math.floor(amount / 2); secondBet = amount - firstBet; }
+    this.cycleStats.totalBetAmount += amount;
+    this.betConfig.betHistory.push({ amount, timestamp: new Date().toISOString(), split: this.betConfig.splitBets, firstBet, secondBet });
     if (this.betConfig.betHistory.length > 100) this.betConfig.betHistory = this.betConfig.betHistory.slice(-100);
-    
-    this.emit('betUpdate', { currentBet: currentBetAmount, totalBetsPlaced: this.cycleStats.totalBetAmount, split: { firstBet, secondBet }, betHistory: this.betConfig.betHistory.length });
-    this.emitTerminalMessage(0, 'debug', `💰 Betting: ${currentBetAmount} (Split: ${firstBet}/${secondBet})`);
-    
+    this.emit('betUpdate', { currentBet: amount, totalBetsPlaced: this.cycleStats.totalBetAmount, split: { firstBet, secondBet } });
+    this.emitTerminalMessage(0, 'debug', `💰 Betting: ${amount} (Split: ${firstBet}/${secondBet})`);
     return {
-      totalBetValue: currentBetAmount,
-      betData: this.generateBetDataArray(currentBetAmount),
+      totalBetValue: amount,
+      betData: this.generateBetDataArray(amount),
       singleDigitBet: new Array(37).fill(0),
       detailBet: [
         [{ "id": [2,4,6,8,11,10,13,15,17,20,22,24,26,29,28,31,33,35], "bet": firstBet }],
         [{ "id": [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36], "bet": secondBet }]
       ],
-      route: 39,
-      mainID: 200,
-      subID: 100
+      route: 39, mainID: 200, subID: 100
     };
   }
 
   generateBetDataArray(betAmount) {
-    const betData = [0];
-    for (let i = 1; i <= 36; i++) betData.push(betAmount);
-    return betData;
+    const d = [0]; for (let i = 1; i <= 36; i++) d.push(betAmount); return d;
   }
 
   updateBetStats(winAmount) {
     if (winAmount && winAmount > 0) {
       this.cycleStats.totalWinAmount += winAmount;
       this.emit('betUpdate', { winAmount, totalWins: this.cycleStats.totalWinAmount, netProfit: this.cycleStats.totalWinAmount - this.cycleStats.totalBetAmount });
-      this.emit('terminal', { type: 'success', message: `💰 Win detected: ${winAmount} | Total Wins: ${this.cycleStats.totalWinAmount}` });
+      this.emit('terminal', { type: 'success', message: `💰 Win: ${winAmount} | Total Wins: ${this.cycleStats.totalWinAmount}` });
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // User agents / fingerprints / headers
+  // ---------------------------------------------------------------------------
 
   generateRealisticUserAgents() {
     return [
@@ -1149,8 +1183,11 @@ class UltimateRouletteProcessor extends EventEmitter {
     ];
   }
 
+  // ---------------------------------------------------------------------------
+  // Cycle management
+  // ---------------------------------------------------------------------------
+
   async resetForNextCycle() {
-    console.log('🔄 RESETTING FOR NEXT CYCLE...');
     for (const [key, ws] of this.connectionPool.entries()) this.safeWebSocketClose(ws, key);
     this.connectionPool.clear();
     this.activeProcesses.clear();
@@ -1159,18 +1196,16 @@ class UltimateRouletteProcessor extends EventEmitter {
     this.cycleStats = this.createFreshCycleStats();
     this.currentProxyIndex = 0;
     if (global.gc) { for (let i = 0; i < 2; i++) { global.gc(); await this.sleep(100); } }
-    await this.sleep(500);
+    await this.sleep(300);
     const memory = this.getMemoryUsage();
-    console.log(`✅ Cycle reset complete. Memory: ${memory}MB | Connections: 0`);
+    console.log(`✅ [${this.instanceId}] Cycle reset. Memory: ${memory}MB`);
     return { success: true, memoryMB: memory, cycleId: this.cycleState.cycleId };
   }
 
   async startProcessing(accountIds, repetitions = 1, useProxy = false, proxyList = []) {
     if (this.isProcessing) throw new Error('Processing already in progress');
 
-    console.log('⚡ [ULTIMATE] Starting speed-optimized processing');
     await this.completeCleanup();
-    
     this.isProcessing = true;
     this.useProxy = useProxy;
     this.proxyList = proxyList;
@@ -1181,37 +1216,32 @@ class UltimateRouletteProcessor extends EventEmitter {
 
     this.totalCycles = Math.max(1, Math.min(50, parseInt(repetitions) || 1));
     this.currentCycle = 0;
-    
+
     this.connectionPool.clear();
     this.activeProcesses.clear();
     this.clearAllTimers();
     this.cycleState = this.createFreshCycleState();
     this.cycleStats = this.createFreshCycleStats();
 
-    // FIX 10: Reset adaptive state at the start of each processing run
-    // so stagger values from a previous slow session don't carry over.
+    // Reset adaptive state for fresh run
     this.adaptiveState.recentLoginTimes = [];
     this.adaptiveState.currentStaggerMs = this.config.BATCH_STAGGER_MS;
     this.adaptiveState.currentBatchDelayMs = this.config.BATCH_DELAY_MS;
     this.adaptiveState.consecutiveSlowBatches = 0;
 
-    this.emit('terminal', { type: 'info', message: '⚡ ULTIMATE SPEED BOT ACTIVATED' });
-    this.emit('terminal', { type: 'info', message: `📋 Total accounts: ${this.currentAccounts.length}` });
-    this.emit('terminal', { type: 'info', message: `🎯 Current Bet: ${this.getCurrentBetAmount()}` });
-    this.emit('terminal', { type: 'info', message: `⚡ Workers: ${this.config.CONCURRENT_WORKERS} concurrent` });
-    this.emit('terminal', { type: 'info', message: `🚀 Target: ${this.config.ACCOUNTS_PER_MINUTE}/minute` });
-    this.emit('terminal', { type: 'info', message: `🛡️ Security: Advanced fingerprint rotation` });
-    this.emit('terminal', { type: 'info', message: `✅ Guarantee: Bet confirmation required` });
+    this.emit('terminal', { type: 'info', message: `⚡ [${this.instanceId}] SPEED BOT ACTIVATED` });
+    this.emit('terminal', { type: 'info', message: `📋 Accounts: ${this.currentAccounts.length}` });
+    this.emit('terminal', { type: 'info', message: `🎯 Bet: ${this.getCurrentBetAmount()}` });
+    this.emit('terminal', { type: 'info', message: `🌐 Global sockets: ${this.getGlobalSocketCount()}/${(this.globalCoordinator || global.GlobalSocketCoordinator)?.MAX_GLOBAL_SOCKETS || '?'}` });
 
     this.startSecurityMonitor();
     this.processAllCycles();
 
-    return { 
-      started: true, 
+    return {
+      started: true,
       totalAccounts: this.currentAccounts.length,
       currentBet: this.getCurrentBetAmount(),
-      targetSpeed: `${this.config.ACCOUNTS_PER_MINUTE}/minute`,
-      securityLevel: 'ULTIMATE',
+      instanceId: this.instanceId,
       cycleId: this.cycleState.cycleId
     };
   }
@@ -1219,16 +1249,14 @@ class UltimateRouletteProcessor extends EventEmitter {
   async processAllCycles() {
     for (let cycle = 1; cycle <= this.totalCycles && this.isProcessing; cycle++) {
       this.currentCycle = cycle;
-      
       if (this.config.COMPLETE_RESET_BETWEEN_CYCLES) await this.resetForNextCycle();
-      
+
       this.cycleState.cycleStartTime = Date.now();
       this.cycleState.isCycleActive = true;
       this.cycleState.cycleId = uuidv4().substring(0, 8);
       this.cycleStats = this.createFreshCycleStats();
-      
-      this.emit('terminal', { type: 'info', message: `\n🔰 CYCLE ${cycle}/${this.totalCycles} - SPEED OPTIMIZED 🔰` });
-      this.emit('terminal', { type: 'info', message: `🆔 Cycle ID: ${this.cycleState.cycleId} (Fresh state)` });
+
+      this.emit('terminal', { type: 'info', message: `\n🔰 CYCLE ${cycle}/${this.totalCycles} [${this.instanceId}]` });
       this.emit('cycleStart', { cycle, totalCycles: this.totalCycles, currentBet: this.getCurrentBetAmount(), startTime: Date.now(), cycleId: this.cycleState.cycleId });
 
       await this.processSingleCycle();
@@ -1240,9 +1268,9 @@ class UltimateRouletteProcessor extends EventEmitter {
       this.cycleState.activeWorkers = 0;
 
       if (cycle < this.totalCycles && this.isProcessing) {
-        const cycleDelay = this.getEnhancedRandomDelay();
-        this.emit('terminal', { type: 'info', message: `⏳ Cycle complete. Waiting ${cycleDelay}ms before next fresh cycle...` });
-        await this.sleep(cycleDelay);
+        const delay = this.getEnhancedRandomDelay();
+        this.emit('terminal', { type: 'info', message: `⏳ Cycle complete. Waiting ${delay}ms...` });
+        await this.sleep(delay);
       }
     }
     this.completeProcessing();
@@ -1255,29 +1283,41 @@ class UltimateRouletteProcessor extends EventEmitter {
     while (processed < totalAccounts && this.isProcessing && this.cycleState.isCycleActive) {
       await this.checkEnhancedRateLimit();
 
+      // IP-block cooldown: if server has blocked this IP, pause here until
+      // the cooldown expires. Check every 5s so we resume promptly.
+      while (this.adaptiveState.isIPBlocked && this.isProcessing) {
+        const elapsed = Date.now() - this.adaptiveState.ipBlockedAt;
+        const remaining = Math.max(0, this.adaptiveState.IP_BLOCK_COOLDOWN_MS - elapsed);
+        if (remaining <= 0) {
+          // Cooldown done — recordLoginTime will clear the flag on next login
+          this.adaptiveState.isIPBlocked = false;
+          this.adaptiveState.recentLoginTimes = [];
+          this.adaptiveState.currentStaggerMs = this.adaptiveState.MAX_STAGGER_MS;
+          this.adaptiveState.currentBatchDelayMs = this.adaptiveState.MAX_BATCH_DELAY_MS;
+          this.emit('terminal', { type: 'info', message: `✅ [${this.instanceId}] IP cooldown done, resuming...` });
+          break;
+        }
+        this.emit('terminal', { type: 'warning', message: `🚫 [${this.instanceId}] IP blocked. Waiting ${Math.round(remaining/1000)}s...` });
+        await this.sleep(5000);
+      }
+      if (!this.isProcessing || !this.cycleState.isCycleActive) break;
+
       const batchSize = Math.min(this.config.BATCH_SIZE, totalAccounts - processed);
       const batchAccounts = this.currentAccounts.slice(processed, processed + batchSize);
 
-      this.emit('terminal', { type: 'info', message: `🚀 Batch ${processed + 1}-${processed + batchSize} (Cycle ${this.currentCycle}) | Stagger: ${this.adaptiveState.currentStaggerMs}ms` });
+      this.emit('terminal', { type: 'info', message: `🚀 Batch ${processed + 1}-${processed + batchSize} [${this.instanceId}] | Stagger: ${this.adaptiveState.currentStaggerMs}ms | GlobalSockets: ${this.getGlobalSocketCount()}` });
 
-      // FIX 11: Use adaptive stagger instead of fixed BATCH_STAGGER_MS.
-      // When 5+ machines run simultaneously, the server sees login bursts
-      // from all of them at the same time. The adaptive stagger increases
-      // automatically when login times rise, reducing the burst naturally.
       const currentStagger = this.adaptiveState.currentStaggerMs;
-      const batchPromises = batchAccounts.map((account, index) => 
+      const batchPromises = batchAccounts.map((account, index) =>
         this.sleep(index * currentStagger).then(() =>
           this.processAccountWithEnhancedSecurity(account, processed + index)
         )
       );
 
       const results = await Promise.allSettled(batchPromises);
-      
       this.updateEnhancedStatistics(results);
       processed += batchSize;
       this.cycleState.processedThisCycle = processed;
-
-      if (this.connectionPool.size > this.config.MAX_CONNECTIONS_PER_CYCLE) await this.cleanupExcessConnections();
 
       this.emit('cycleProgress', {
         processed, total: totalAccounts, currentCycle: this.currentCycle, totalCycles: this.totalCycles,
@@ -1286,26 +1326,15 @@ class UltimateRouletteProcessor extends EventEmitter {
         adaptiveStagger: this.adaptiveState.currentStaggerMs
       });
 
-      // FIX 12: Use adaptive batch delay instead of fixed BATCH_DELAY_MS
       if (processed < totalAccounts) await this.sleep(this.adaptiveState.currentBatchDelayMs);
     }
-    
-    await this.cleanupCycleConnections();
-  }
 
-  async cleanupExcessConnections() {
-    const excess = this.connectionPool.size - this.config.MAX_CONNECTIONS_PER_CYCLE;
-    if (excess > 0) {
-      const keys = Array.from(this.connectionPool.keys()).slice(0, excess);
-      keys.forEach(key => { const ws = this.connectionPool.get(key); if (ws) this.safeWebSocketClose(ws, key); this.connectionPool.delete(key); });
-      this.emit('terminal', { type: 'debug', message: `🧹 Cleaned ${excess} excess connections (Now: ${this.connectionPool.size})` });
-      await this.sleep(50);
-    }
+    await this.cleanupCycleConnections();
   }
 
   async cleanupCycleConnections() {
     if (this.connectionPool.size > 0) {
-      this.emit('terminal', { type: 'debug', message: `🧹 Closing ${this.connectionPool.size} cycle connections...` });
+      this.emit('terminal', { type: 'debug', message: `🧹 Closing ${this.connectionPool.size} cycle connections [${this.instanceId}]...` });
       for (const [key, ws] of this.connectionPool.entries()) this.safeWebSocketClose(ws, key);
       this.connectionPool.clear();
       await this.sleep(100);
@@ -1322,7 +1351,7 @@ class UltimateRouletteProcessor extends EventEmitter {
       this.emit('status', {
         running: true, total: this.currentAccounts.length, current: globalIndex + 1,
         activeWorkers: this.cycleState.activeWorkers, currentAccount: account.username,
-        speed: `${this.cycleStats.processedThisMinute}/minute`, security: 'ENHANCED',
+        speed: `${this.cycleStats.processedThisMinute}/minute`, instanceId: this.instanceId,
         currentBet: this.getCurrentBetAmount(), cycle: this.currentCycle, cycleId: this.cycleState.cycleId
       });
 
@@ -1341,8 +1370,8 @@ class UltimateRouletteProcessor extends EventEmitter {
         await this.db.addProcessingLog(
           account.id,
           result.confirmed ? 'confirmed_success' : 'assumed_success',
-          result.confirmed ? 'Bet confirmed by server' : 'Bet assumed successful',
-          { ...result, cycle: this.currentCycle, cycleId: this.cycleState.cycleId, timestamp: new Date().toISOString(), fingerprint: result.fingerprint, betAmount: this.getCurrentBetAmount(), winAmount: result.winCredit || 0, duration: result.duration || 0 }
+          result.confirmed ? 'Bet confirmed' : 'Bet assumed successful',
+          { ...result, cycle: this.currentCycle, cycleId: this.cycleState.cycleId, timestamp: new Date().toISOString(), betAmount: this.getCurrentBetAmount(), winAmount: result.winCredit || 0, duration: result.duration || 0 }
         );
       }
 
@@ -1354,9 +1383,8 @@ class UltimateRouletteProcessor extends EventEmitter {
       });
 
       return result;
-
     } catch (error) {
-      this.emitTerminalMessage(globalIndex, 'error', `🛡️ Secure error: ${error.message}`);
+      this.emitTerminalMessage(globalIndex, 'error', `🛡️ Error: ${error.message}`);
       return { success: false, error: error.message };
     } finally {
       this.cycleState.activeWorkers--;
@@ -1376,32 +1404,31 @@ class UltimateRouletteProcessor extends EventEmitter {
 
     try {
       const loginResult = await this.enhancedLogin(account, userAgent, headers, proxy, index);
-      if (!loginResult.success) throw new Error(`Secure login failed: ${loginResult.error}`);
+      if (!loginResult.success) throw new Error(`Login failed: ${loginResult.error}`);
 
-      // FIX 13: Feed login time into adaptive system after every login
-      if (loginResult.loginTime) {
-        this.recordLoginTime(loginResult.loginTime);
-      }
+      if (loginResult.loginTime) this.recordLoginTime(loginResult.loginTime);
 
       Object.assign(account, loginResult.accountData);
       account.sessionId = sessionId;
 
       const gameResult = await this.guaranteedGameFlow(account, userAgent, headers, proxy, index, sessionId);
       const duration = Date.now() - startTime;
-      
-      return { ...gameResult, sessionId, fingerprint: fingerprint.deviceId, userAgent: userAgent.substring(0, 50) + '...', duration, cycleId: this.cycleState.cycleId };
 
+      return { ...gameResult, sessionId, fingerprint: fingerprint.deviceId, duration, cycleId: this.cycleState.cycleId };
     } catch (error) {
-      // Record a penalty time for failed logins so adaptive backoff triggers
       this.recordLoginTime(this.config.TIMEOUTS.LOGIN);
       return { success: false, error: error.message, sessionId, fingerprint: fingerprint?.deviceId, cycleId: this.cycleState.cycleId };
     }
   }
 
   async enhancedLogin(account, userAgent, headers, proxy, index) {
+    // Acquire a global socket slot before opening the connection
+    await this.acquireSocket();
+
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.activeTimeouts.delete(timeout);
+        this.releaseSocket();
         reject(new Error('Enhanced login timeout'));
       }, this.config.TIMEOUTS.LOGIN);
       this.activeTimeouts.add(timeout);
@@ -1429,6 +1456,7 @@ class UltimateRouletteProcessor extends EventEmitter {
         this.activeTimeouts.delete(timeout);
         this.safeWebSocketClose(loginWs, connectionKey);
         this.connectionPool.delete(connectionKey);
+        this.releaseSocket();   // Release global slot
         if (rejectErr) reject(rejectErr);
         else resolve(resolveValue);
       };
@@ -1462,20 +1490,20 @@ class UltimateRouletteProcessor extends EventEmitter {
       });
 
       loginWs.on('close', () => {
-        if (!loginCompleted) {
-          cleanup({ success: false, error: 'Login connection closed unexpectedly' });
-        }
+        if (!loginCompleted) cleanup({ success: false, error: 'Login connection closed unexpectedly' });
       });
     });
   }
 
   async guaranteedGameFlow(account, userAgent, headers, proxy, index, sessionId) {
+    // Acquire global socket slot for game connection
+    await this.acquireSocket();
+
     return new Promise((resolve) => {
       const gameStartTime = Date.now();
       let gameWs = null;
       let betConfirmed = false;
       let balanceChanged = false;
-      let originalBalance = account.score;
       let heartbeatInterval = null;
       let mainTimeout = null;
       let isFinalized = false;
@@ -1487,6 +1515,7 @@ class UltimateRouletteProcessor extends EventEmitter {
         if (heartbeatInterval) { clearInterval(heartbeatInterval); this.activeIntervals.delete(heartbeatInterval); heartbeatInterval = null; }
         if (mainTimeout) { clearTimeout(mainTimeout); this.activeTimeouts.delete(mainTimeout); mainTimeout = null; }
         if (gameWs) { this.safeWebSocketClose(gameWs, connectionKey); this.connectionPool.delete(connectionKey); gameWs = null; }
+        this.releaseSocket();   // Release global slot
         const gameTime = Date.now() - gameStartTime;
         this.emitTerminalMessage(index, 'debug', `⏱️ Session: ${gameTime}ms`);
         resolve(result);
@@ -1497,11 +1526,11 @@ class UltimateRouletteProcessor extends EventEmitter {
           this.emitTerminalMessage(index, 'warning', `⏰ Timeout (${this.config.TIMEOUTS.BET_RESPONSE}ms)`);
           finalize({ success: balanceChanged, confirmed: false, assumed: balanceChanged, newBalance: account.score, timeout: true });
         }
-      }, this.config.TIMEOUTS.BET_RESPONSE + 10000);
+      }, this.config.TIMEOUTS.BET_RESPONSE + 6000);
       this.activeTimeouts.add(mainTimeout);
 
       const wsOptions = {
-        handshakeTimeout: 15000,
+        handshakeTimeout: 8000,
         headers: { 'User-Agent': userAgent, 'Origin': 'http://localhost', ...headers }
       };
       if (proxy) wsOptions.agent = new SocksProxyAgent(proxy);
@@ -1519,20 +1548,20 @@ class UltimateRouletteProcessor extends EventEmitter {
 
       gameWs.on('open', () => {
         this.emitTerminalMessage(index, 'success', `🎮 Connected`);
-        
-        const sendWithConfirmation = (payload, description, delay = 0) => {
+
+        const send = (payload, desc, delay = 0) => {
           setTimeout(() => {
             if (gameWs && gameWs.readyState === WebSocket.OPEN && !isFinalized) {
-              this.emitTerminalMessage(index, 'debug', `📤 ${description}`);
+              this.emitTerminalMessage(index, 'debug', `📤 ${desc}`);
               gameWs.send(JSON.stringify(payload));
             }
           }, delay);
         };
 
-        sendWithConfirmation(this.createEnterGamePayload(account), 'Enter', 100);
-        sendWithConfirmation(this.createJoinGamePayload(account), 'Join', 500);
-        sendWithConfirmation(this.createGameInitPayload(), 'Init', 1000);
-        
+        send(this.createEnterGamePayload(account), 'Enter', 100);
+        send(this.createJoinGamePayload(account), 'Join', 500);
+        send(this.createGameInitPayload(), 'Init', 1000);
+
         heartbeatInterval = setInterval(() => {
           if (gameWs && gameWs.readyState === WebSocket.OPEN && !isFinalized) {
             gameWs.send(JSON.stringify(this.createJoinTablePayload(account)));
@@ -1542,12 +1571,12 @@ class UltimateRouletteProcessor extends EventEmitter {
         }, 5000);
         this.activeIntervals.add(heartbeatInterval);
 
-        sendWithConfirmation(this.createJoinTablePayload(account), 'Table', 1500);
-        
+        send(this.createJoinTablePayload(account), 'Table', 1500);
+
         setTimeout(() => {
           if (gameWs && gameWs.readyState === WebSocket.OPEN && !isFinalized) {
-            const currentBet = this.getCurrentBetAmount();
-            this.emitTerminalMessage(index, 'info', `🎯 Betting ${currentBet}...`);
+            const bet = this.getCurrentBetAmount();
+            this.emitTerminalMessage(index, 'info', `🎯 Betting ${bet}...`);
             gameWs.send(JSON.stringify(this.createBetPayload()));
           }
         }, 2000);
@@ -1559,7 +1588,7 @@ class UltimateRouletteProcessor extends EventEmitter {
           const msg = JSON.parse(raw.toString());
           if (msg.mainID === 1 && msg.subID === 104 && msg.data?.score) {
             const newBalance = msg.data.score;
-            if (newBalance !== originalBalance) { balanceChanged = true; account.score = newBalance; this.emitTerminalMessage(index, 'debug', `💰 Balance: ${newBalance}`); }
+            if (newBalance !== account.score) { balanceChanged = true; account.score = newBalance; }
           }
           if (msg.mainID === 200 && msg.subID === 100 && msg.data?.route === 39) {
             betConfirmed = true;
@@ -1578,12 +1607,13 @@ class UltimateRouletteProcessor extends EventEmitter {
 
   async checkEnhancedRateLimit() {
     const now = Date.now();
-    const minuteElapsed = now - this.cycleStats.minuteStartTime > 60000;
-    if (minuteElapsed) { this.cycleStats.minuteStartTime = now; this.cycleStats.processedThisMinute = 0; return; }
-    const remainingSlots = this.config.ACCOUNTS_PER_MINUTE - this.cycleStats.processedThisMinute;
-    if (remainingSlots <= 0) {
+    if (now - this.cycleStats.minuteStartTime > 60000) {
+      this.cycleStats.minuteStartTime = now; this.cycleStats.processedThisMinute = 0; return;
+    }
+    const remaining = this.config.ACCOUNTS_PER_MINUTE - this.cycleStats.processedThisMinute;
+    if (remaining <= 0) {
       const waitTime = 60000 - (now - this.cycleStats.minuteStartTime) + 1000;
-      this.emit('terminal', { type: 'warning', message: `🛡️ Security cooldown: ${Math.round(waitTime/1000)}s` });
+      this.emit('terminal', { type: 'warning', message: `🛡️ Rate limit cooldown: ${Math.round(waitTime/1000)}s` });
       await this.sleep(waitTime);
       this.cycleStats.minuteStartTime = Date.now();
       this.cycleStats.processedThisMinute = 0;
@@ -1593,24 +1623,21 @@ class UltimateRouletteProcessor extends EventEmitter {
   updateEnhancedStatistics(results) {
     results.forEach(result => {
       if (result.status === 'fulfilled' && result.value.success) {
-        this.cycleStats.successCount++;
-        this.cycleStats.cycleSuccessCount++;
+        this.cycleStats.successCount++; this.cycleStats.cycleSuccessCount++;
         if (result.value.confirmed) this.cycleStats.confirmedBets++;
         else if (result.value.assumed) this.cycleStats.assumedBets++;
       } else {
-        this.cycleStats.failCount++;
-        this.cycleStats.cycleFailCount++;
+        this.cycleStats.failCount++; this.cycleStats.cycleFailCount++;
       }
       this.cycleStats.processedThisMinute++;
     });
     this.emit('cycleUpdate', {
       cyclesCompleted: this.currentCycle, totalCycles: this.totalCycles,
       successCount: this.cycleStats.successCount, failCount: this.cycleStats.failCount,
-      confirmedBets: this.cycleStats.confirmedBets, totalBetAmount: this.cycleStats.totalBetAmount,
-      totalWinAmount: this.cycleStats.totalWinAmount,
+      confirmedBets: this.cycleStats.confirmedBets,
+      totalBetAmount: this.cycleStats.totalBetAmount, totalWinAmount: this.cycleStats.totalWinAmount,
       cycleSuccessRate: (this.cycleStats.cycleSuccessCount / (this.cycleStats.cycleSuccessCount + this.cycleStats.cycleFailCount)) * 100 || 0,
-      cycleId: this.cycleState.cycleId,
-      adaptiveStagger: this.adaptiveState.currentStaggerMs
+      cycleId: this.cycleState.cycleId, adaptiveStagger: this.adaptiveState.currentStaggerMs
     });
   }
 
@@ -1618,45 +1645,46 @@ class UltimateRouletteProcessor extends EventEmitter {
     const interval = setInterval(() => {
       const speed = this.cycleStats.processedThisMinute;
       const successRate = this.cycleStats.successCount / (this.cycleStats.successCount + this.cycleStats.failCount) * 100 || 0;
-      const netProfit = this.cycleStats.totalWinAmount - this.cycleStats.totalBetAmount;
       const avgLogin = this.adaptiveState.recentLoginTimes.length > 0
         ? Math.round(this.adaptiveState.recentLoginTimes.reduce((a, b) => a + b, 0) / this.adaptiveState.recentLoginTimes.length)
         : 0;
+      const globalSockets = this.getGlobalSocketCount();
 
-      this.emit('terminal', { 
-        type: 'info', 
-        message: `🚀 Speed: ${speed}/min | Success: ${successRate.toFixed(1)}% | Memory: ${this.getMemoryUsage()}MB | Workers: ${this.cycleState.activeWorkers} | Avg Login: ${avgLogin}ms | Stagger: ${this.adaptiveState.currentStaggerMs}ms` 
+      this.emit('terminal', {
+        type: 'info',
+        message: `🚀 [${this.instanceId}] Speed: ${speed}/min | Success: ${successRate.toFixed(1)}% | Mem: ${this.getMemoryUsage()}MB | Workers: ${this.cycleState.activeWorkers} | AvgLogin: ${avgLogin}ms | Stagger: ${this.adaptiveState.currentStaggerMs}ms | GlobalSockets: ${globalSockets}`
       });
       this.emit('status', {
-        running: this.isProcessing, speed: `${speed}/minute`,
+        running: this.isProcessing, speed: `${speed}/minute`, instanceId: this.instanceId,
         successCount: this.cycleStats.successCount, failCount: this.cycleStats.failCount,
         confirmedBets: this.cycleStats.confirmedBets, successRate: `${successRate.toFixed(1)}%`,
         currentBet: this.getCurrentBetAmount(), totalBetAmount: this.cycleStats.totalBetAmount,
-        totalWinAmount: this.cycleStats.totalWinAmount, netProfit,
+        totalWinAmount: this.cycleStats.totalWinAmount,
         cycle: this.currentCycle, cycleId: this.cycleState.cycleId,
         activeConnections: this.connectionPool.size, activeWorkers: this.cycleState.activeWorkers,
-        memoryUsage: this.getMemoryUsage() + 'MB',
-        avgLoginMs: avgLogin,
-        adaptiveStagger: this.adaptiveState.currentStaggerMs
+        memoryUsage: this.getMemoryUsage() + 'MB', avgLoginMs: avgLogin,
+        adaptiveStagger: this.adaptiveState.currentStaggerMs, globalSockets
       });
     }, 15000);
     this.activeIntervals.add(interval);
     this.securityInterval = interval;
   }
 
+  // ---------------------------------------------------------------------------
+  // Utility methods
+  // ---------------------------------------------------------------------------
+
   safeWebSocketClose(ws, identifier = 'unknown') {
     if (!ws) return;
     try {
-      ws.removeAllListeners('open');
-      ws.removeAllListeners('message');
-      ws.removeAllListeners('error');
-      ws.removeAllListeners('close');
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1000, `Cleanup ${identifier}`);
+      ws.removeAllListeners('open'); ws.removeAllListeners('message');
+      ws.removeAllListeners('error'); ws.removeAllListeners('close');
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(1000, `Cleanup ${identifier}`);
+      }
       ws.onerror = null; ws.onclose = null; ws.onmessage = null; ws.onopen = null;
     } catch (error) {
       console.warn(`Safe close error for ${identifier}:`, error.message);
-    } finally {
-      ws = null;
     }
   }
 
@@ -1678,9 +1706,7 @@ class UltimateRouletteProcessor extends EventEmitter {
     await this.sleep(100);
   }
 
-  getMemoryUsage() {
-    return Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-  }
+  getMemoryUsage() { return Math.round(process.memoryUsage().heapUsed / 1024 / 1024); }
 
   emitTerminalMessage(index, type, message) {
     this.emit('terminal', { type, message: `[C${this.currentCycle}][${index}] ${message}`, timestamp: new Date().toISOString(), cycleId: this.cycleState.cycleId });
@@ -1690,7 +1716,7 @@ class UltimateRouletteProcessor extends EventEmitter {
     this.isProcessing = false;
     this.cycleState.isCycleActive = false;
     await this.completeCleanup();
-    this.emit('terminal', { type: 'warning', message: '🛑 Ultimate processing stopped' });
+    this.emit('terminal', { type: 'warning', message: `🛑 [${this.instanceId}] Processing stopped` });
     this.emit('status', { running: false });
     return { success: true, message: 'Processing stopped', finalBetConfig: this.getBetConfig(), cyclesCompleted: this.currentCycle };
   }
@@ -1704,9 +1730,8 @@ class UltimateRouletteProcessor extends EventEmitter {
     const totalProcessed = this.cycleStats.successCount + this.cycleStats.failCount;
     const successRate = (this.cycleStats.successCount / totalProcessed) * 100 || 0;
 
-    this.emit('terminal', { type: 'success', message: '\n🎉 ULTIMATE PROCESSING COMPLETED!' });
-    this.emit('terminal', { type: 'info', message: `📈 Final Results: ${this.cycleStats.successCount}/${totalProcessed} successful (${successRate.toFixed(1)}%)` });
-    this.emit('terminal', { type: 'info', message: `🛡️ All cycles completed successfully` });
+    this.emit('terminal', { type: 'success', message: `\n🎉 [${this.instanceId}] PROCESSING COMPLETED!` });
+    this.emit('terminal', { type: 'info', message: `📈 Results: ${this.cycleStats.successCount}/${totalProcessed} successful (${successRate.toFixed(1)}%)` });
     this.emit('terminal', { type: 'info', message: `🧹 Memory after cleanup: ${this.getMemoryUsage()}MB` });
 
     this.emit('completed', {
@@ -1718,6 +1743,7 @@ class UltimateRouletteProcessor extends EventEmitter {
     this.emit('status', { running: false });
   }
 
+  // Payload builders
   createLoginPayload(account) { return { account: account.username, password: account.password, version: this.config.GAME_VERSION, mainID: 100, subID: 6 }; }
   createEnterGamePayload(account) { return { mainID: 1, subID: 5, userid: account.userid, password: account.dynamicpass }; }
   createJoinGamePayload(account) { return { mainID: 1, subID: 4, gameid: account.gameid || 10658796, password: account.dynamicpass, reenter: 0 }; }
@@ -1730,17 +1756,8 @@ class UltimateRouletteProcessor extends EventEmitter {
     const fp = this.deviceFingerprints[Math.floor(Math.random() * this.deviceFingerprints.length)];
     return { ...fp, timezone: this.getRandomTimezone(), language: this.getRandomLanguage() };
   }
-
-  getRandomTimezone() {
-    const tz = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'];
-    return tz[Math.floor(Math.random() * tz.length)];
-  }
-
-  getRandomLanguage() {
-    const langs = ['en-US', 'en-CA', 'en-GB', 'en-AU'];
-    return langs[Math.floor(Math.random() * langs.length)];
-  }
-
+  getRandomTimezone() { const tz = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles']; return tz[Math.floor(Math.random() * tz.length)]; }
+  getRandomLanguage() { const l = ['en-US', 'en-CA', 'en-GB', 'en-AU']; return l[Math.floor(Math.random() * l.length)]; }
   getRandomUserAgent() { return this.mobileUserAgents[Math.floor(Math.random() * this.mobileUserAgents.length)]; }
   getRandomHeaders() { return this.headerVariations[Math.floor(Math.random() * this.headerVariations.length)]; }
 
@@ -1758,9 +1775,3 @@ class UltimateRouletteProcessor extends EventEmitter {
 }
 
 module.exports = UltimateRouletteProcessor;
-
-
-
-
-// version 2.0.2 - Major rewrite with enhanced security, adaptive timing, and detailed statistics. Added guaranteed bet confirmation flow and advanced fingerprint rotation. Implemented comprehensive error handling and resource management for high concurrency. Designed for maximum speed while minimizing detection risk.
-

@@ -67,87 +67,128 @@
 // });
 
 
+
 const { contextBridge, ipcRenderer } = require('electron');
 
-// FIX 7: Wrap ipcRenderer.on() so that each channel can only have ONE
-// listener at a time. The renderer's setupIPCListeners() was called
-// multiple times (on init AND on onShowMainApp), causing every terminal
-// message, progress update, and bet event to be delivered 2-4× and
-// printed multiple times in the terminal output.
+// ---------------------------------------------------------------------------
+// INSTANCE ID — fetched synchronously from main before anything else runs
+// ---------------------------------------------------------------------------
+// WHY NOT additionalArguments / process.argv:
+//   additionalArguments are injected into the RENDERER's process.argv, not
+//   the preload's. The preload runs in a separate V8 context where
+//   process.argv only contains Electron's own launch flags. So the
+//   --instanceId=... arg is invisible here and the fallback fires, producing
+//   a different ID than main registered handlers under → "No handler" errors.
+//
+// FIX: ipcRenderer.sendSync on a one-time bootstrap channel that main
+//   registers before the window loads. sendSync blocks the preload until
+//   main responds, guaranteeing the correct ID before contextBridge.expose.
+// ---------------------------------------------------------------------------
+
+let instanceId;
+try {
+  // Main registers 'preload:getInstanceId' per-window before loadFile()
+  instanceId = ipcRenderer.sendSync('preload:getInstanceId');
+} catch (e) {
+  // Absolute fallback — should never happen in normal operation
+  instanceId = `inst_fallback_${Date.now().toString(36)}`;
+  console.error('❌ preload: failed to get instanceId from main:', e.message);
+}
+
+if (!instanceId || typeof instanceId !== 'string') {
+  instanceId = `inst_bad_${Date.now().toString(36)}`;
+  console.error('❌ preload: instanceId from main was invalid:', instanceId);
+}
+
+// Prefix every IPC channel with this instance's namespace
+function ch(channel) {
+  return `${instanceId}:${channel}`;
+}
+
+// ---------------------------------------------------------------------------
+// DEDUPLICATION — one active listener per logical channel name
+// ---------------------------------------------------------------------------
 const listenerRegistry = new Map();
 
 function safeOn(channel, callback) {
-  // Remove any existing listener for this channel first
   if (listenerRegistry.has(channel)) {
     ipcRenderer.removeListener(channel, listenerRegistry.get(channel));
   }
-  // Wrap to match Electron's (event, data) signature
-  const wrapped = (event, data) => callback(event, data);
+  const wrapped = (_event, data) => callback(_event, data);
   listenerRegistry.set(channel, wrapped);
   ipcRenderer.on(channel, wrapped);
 }
 
+// ---------------------------------------------------------------------------
+// EXPOSE API TO RENDERER
+// ---------------------------------------------------------------------------
 contextBridge.exposeInMainWorld('electronAPI', {
-  // User Management APIs
+
+  // Renderer can read the resolved instanceId for debugging
+  getInstanceId: () => instanceId,
+
+  // User Management
   userManagement: {
-    initialize: () => ipcRenderer.invoke('user-management:initialize'),
-    getCurrentUser: () => ipcRenderer.invoke('user-management:getCurrentUser'),
-    registerUser: (email, password) => ipcRenderer.invoke('user-management:register', email, password),
-    loginUser: (email, password) => ipcRenderer.invoke('user-management:login', email, password),
-
-    // Auth state listeners - also deduplicated
-    onShowRegistration: (callback) => safeOn('show-registration', callback),
-    onShowMainApp: (callback) => safeOn('show-main-app', callback),
-    onShowPendingApproval: (callback) => safeOn('show-pending-approval', callback)
+    initialize:     ()             => ipcRenderer.invoke(ch('user-management:initialize')),
+    getCurrentUser: ()             => ipcRenderer.invoke(ch('user-management:getCurrentUser')),
+    registerUser:   (email, pass)  => ipcRenderer.invoke(ch('user-management:register'), email, pass),
+    loginUser:      (email, pass)  => ipcRenderer.invoke(ch('user-management:login'), email, pass),
+    onShowRegistration:    (cb) => safeOn('show-registration',    cb),
+    onShowMainApp:         (cb) => safeOn('show-main-app',         cb),
+    onShowPendingApproval: (cb) => safeOn('show-pending-approval', cb)
   },
 
-  // Account management
+  // Accounts — talk to THIS instance's database only
   accounts: {
-    getAll: () => ipcRenderer.invoke('accounts:getAll'),
-    add: (account) => ipcRenderer.invoke('accounts:add', account),
-    addBulk: (accounts) => ipcRenderer.invoke('accounts:addBulk', accounts),
-    update: (account) => ipcRenderer.invoke('accounts:update', account),
-    delete: (id) => ipcRenderer.invoke('accounts:delete', id),
-    deleteMultiple: (ids) => ipcRenderer.invoke('accounts:deleteMultiple', ids)
+    getAll:         ()          => ipcRenderer.invoke(ch('accounts:getAll')),
+    add:            (account)   => ipcRenderer.invoke(ch('accounts:add'),            account),
+    addBulk:        (accounts)  => ipcRenderer.invoke(ch('accounts:addBulk'),        accounts),
+    update:         (account)   => ipcRenderer.invoke(ch('accounts:update'),         account),
+    delete:         (id)        => ipcRenderer.invoke(ch('accounts:delete'),         id),
+    deleteMultiple: (ids)       => ipcRenderer.invoke(ch('accounts:deleteMultiple'), ids)
   },
 
-  // Processing control
+  // Processing
   processing: {
-    start: (accountIds, repetitions) => ipcRenderer.invoke('processing:start', accountIds, repetitions),
-    stop: () => ipcRenderer.invoke('processing:stop'),
-    getStatus: () => ipcRenderer.invoke('processing:getStatus')
+    start:     (accountIds, reps) => ipcRenderer.invoke(ch('processing:start'), accountIds, reps),
+    stop:      ()                 => ipcRenderer.invoke(ch('processing:stop')),
+    getStatus: ()                 => ipcRenderer.invoke(ch('processing:getStatus'))
   },
 
+  // Profile
   profile: {
-    getCurrent: () => ipcRenderer.invoke('profile:getCurrent'),
-    getAll: () => ipcRenderer.invoke('profile:getAll')
+    getCurrent: () => ipcRenderer.invoke(ch('profile:getCurrent')),
+    getAll:     () => ipcRenderer.invoke(ch('profile:getAll'))
   },
 
-  // Bet Management APIs
+  // Bet management
   bet: {
-    setAmount: (amount) => ipcRenderer.invoke('bet:setAmount', amount),
-    reset: () => ipcRenderer.invoke('bet:reset'),
-    getConfig: () => ipcRenderer.invoke('bet:getConfig'),
-    updateConfig: (config) => ipcRenderer.invoke('bet:updateConfig', config),
-    getCurrent: () => ipcRenderer.invoke('bet:getCurrent')
+    setAmount:    (amount) => ipcRenderer.invoke(ch('bet:setAmount'),    amount),
+    reset:        ()       => ipcRenderer.invoke(ch('bet:reset')),
+    getConfig:    ()       => ipcRenderer.invoke(ch('bet:getConfig')),
+    updateConfig: (config) => ipcRenderer.invoke(ch('bet:updateConfig'), config),
+    getCurrent:   ()       => ipcRenderer.invoke(ch('bet:getCurrent'))
   },
 
-  // Event listeners - all deduplicated via safeOn
-  onProcessingStatus: (callback) => safeOn('processing:status', callback),
-  onProcessingTerminal: (callback) => safeOn('processing:terminal', callback),
-  onProcessingProgress: (callback) => safeOn('processing:progress', callback),
-  onProcessingCompleted: (callback) => safeOn('processing:completed', callback),
-  onCycleUpdate: (callback) => safeOn('processing:cycleUpdate', callback),
-  onCycleStart: (callback) => safeOn('processing:cycleStart', callback),
-  onCycleComplete: (callback) => safeOn('processing:cycleComplete', callback),
-  onCycleProgress: (callback) => safeOn('processing:cycleProgress', callback),
+  // Processing events — sent directly to this BrowserWindow, no namespace needed
+  onProcessingStatus:    (cb) => safeOn('processing:status',    cb),
+  onProcessingTerminal:  (cb) => safeOn('processing:terminal',  cb),
+  onProcessingProgress:  (cb) => safeOn('processing:progress',  cb),
+  onProcessingCompleted: (cb) => safeOn('processing:completed', cb),
+  onCycleUpdate:         (cb) => safeOn('processing:cycleUpdate',  cb),
+  onCycleStart:          (cb) => safeOn('processing:cycleStart',   cb),
+  onCycleComplete:       (cb) => safeOn('processing:cycleComplete', cb),
+  onCycleProgress:       (cb) => safeOn('processing:cycleProgress', cb),
 
-  // Bet event listeners
-  onBetConfigChanged: (callback) => safeOn('bet:configChanged', callback),
-  onBetUpdate: (callback) => safeOn('bet:update', callback),
-  onBetError: (callback) => safeOn('bet:error', callback),
+  // Bet events
+  onBetConfigChanged: (cb) => safeOn('bet:configChanged', cb),
+  onBetUpdate:        (cb) => safeOn('bet:update',        cb),
+  onBetError:         (cb) => safeOn('bet:error',         cb),
 
-  // Remove a specific channel's listener
+  // App identity (main pushes this after load as a convenience)
+  onAppInstanceId: (cb) => safeOn('app:instanceId', cb),
+
+  // Remove a registered listener by logical channel name
   removeAllListeners: (channel) => {
     if (listenerRegistry.has(channel)) {
       ipcRenderer.removeListener(channel, listenerRegistry.get(channel));

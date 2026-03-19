@@ -609,8 +609,6 @@
 // process.on('unhandledRejection', (reason, promise) => {
 //   console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
 // });
-
-
 const { app, BrowserWindow, ipcMain, Menu, dialog } = require('electron');
 const path = require('path');
 const Database = require('../database/database');
@@ -619,20 +617,99 @@ const crypto = require('crypto');
 const MainUserManager = require("./auth/MainUserManager");
 app.commandLine.appendSwitch('js-flags', '--expose-gc');
 
-// FIX 1: Track registered IPC handlers globally so multiple FireKirinApp
-// instances (created on 'activate') never double-register channels.
-// ipcMain.handle() throws "Attempted to register a second handler" if called
-// twice on the same channel, crashing the app on macOS re-open.
-const registeredHandlers = new Set();
+// ---------------------------------------------------------------------------
+// MULTI-INSTANCE IPC NAMESPACE REGISTRY
+// ---------------------------------------------------------------------------
+// ROOT PROBLEM WITH MULTIPLE PROFILES ON ONE PC:
+// All Electron renderer processes in the same app share one ipcMain. When
+// Profile 1 registers 'accounts:getAll' and then Profile 2 also registers
+// 'accounts:getAll', Profile 2's handler silently replaces Profile 1's.
+// From that point, both windows call the same handler — Profile 1's DB
+// queries go to Profile 2's database.
+//
+// FIX: Each FireKirinApp instance gets a unique instanceId. All IPC channels
+// are prefixed with that id (e.g. 'inst_a3f2:accounts:getAll'). The preload
+// receives the instanceId via a dedicated bootstrap channel and builds all
+// its ipcRenderer.invoke() calls using that prefix. This completely isolates
+// IPC handlers between profiles running on the same machine.
+// ---------------------------------------------------------------------------
 
-function safeHandle(channel, handler) {
-  if (registeredHandlers.has(channel)) {
-    ipcMain.removeHandler(channel);
-  }
-  ipcMain.handle(channel, handler);
-  registeredHandlers.add(channel);
+const activeInstances = new Map();    // instanceId -> FireKirinApp
+const instanceHandlers = new Map();   // instanceId -> Set of channel names
+
+function registerInstanceHandler(instanceId, channel, handler) {
+  const fullChannel = `${instanceId}:${channel}`;
+  // Remove any previous handler for this exact full channel
+  try { ipcMain.removeHandler(fullChannel); } catch (_) {}
+  ipcMain.handle(fullChannel, handler);
+  if (!instanceHandlers.has(instanceId)) instanceHandlers.set(instanceId, new Set());
+  instanceHandlers.get(instanceId).add(fullChannel);
 }
 
+function unregisterInstanceHandlers(instanceId) {
+  const channels = instanceHandlers.get(instanceId);
+  if (!channels) return;
+  for (const ch of channels) {
+    try { ipcMain.removeHandler(ch); } catch (_) {}
+  }
+  instanceHandlers.delete(instanceId);
+}
+
+// ---------------------------------------------------------------------------
+// GLOBAL SOCKET COORDINATOR
+// ---------------------------------------------------------------------------
+// With 4 profiles on one PC, total concurrent sockets can reach 4 × 10 = 40.
+// The OS/server starts dropping connections above ~15-20 simultaneous TCP
+// handshakes from one IP. This coordinator enforces a global socket cap
+// across ALL profiles so the total never exceeds MAX_GLOBAL_SOCKETS.
+// Each profile acquires a slot before opening a socket and releases it after.
+// ---------------------------------------------------------------------------
+const GlobalSocketCoordinator = {
+  // SPEED FIX: Raised from 12 to 30.
+  // Old value of 12 allowed only 6 accounts to run concurrently (each holds
+  // 2 slots momentarily during login→game transition). With 30 slots,
+  // 4 profiles × 8 batch size = 32 peak — the coordinator queues the last 2
+  // gracefully rather than serializing all 32.
+  // On a single profile, 8 concurrent accounts fit easily within 30.
+  // 14 = safe ceiling for 4 profiles on one IP.
+  // Server blocks after ~16 simultaneous connections; 14 gives a 2-slot margin.
+  // Single profile: 4 concurrent sockets, plenty of headroom.
+  MAX_GLOBAL_SOCKETS: 14,
+  currentCount: 0,
+  waitQueue: [],
+
+  acquire() {
+    return new Promise((resolve) => {
+      const tryAcquire = () => {
+        if (this.currentCount < this.MAX_GLOBAL_SOCKETS) {
+          this.currentCount++;
+          resolve();
+        } else {
+          this.waitQueue.push(tryAcquire);
+        }
+      };
+      tryAcquire();
+    });
+  },
+
+  release() {
+    this.currentCount = Math.max(0, this.currentCount - 1);
+    if (this.waitQueue.length > 0) {
+      const next = this.waitQueue.shift();
+      next();
+    }
+  },
+
+  getCount() { return this.currentCount; },
+  getQueueLength() { return this.waitQueue.length; }
+};
+
+// Expose coordinator to processor instances
+global.GlobalSocketCoordinator = GlobalSocketCoordinator;
+
+// ---------------------------------------------------------------------------
+// FireKirinApp — one instance per profile window
+// ---------------------------------------------------------------------------
 class FireKirinApp {
   constructor() {
     this.mainWindow = null;
@@ -640,18 +717,20 @@ class FireKirinApp {
     this.processor = null;
     this.userManager = null;
     this.profileName = null;
-    // FIX 2: Track whether processing listeners are attached to this
-    // specific processor instance, not just whether any listeners exist.
     this._processingListenersAttached = false;
+
+    // Unique id for this profile instance's IPC namespace
+    this.instanceId = `inst_${Math.random().toString(36).substring(2, 8)}`;
+    activeInstances.set(this.instanceId, this);
   }
 
   async init() {
-    console.log('🚀 Initializing Milkyway App...');
+    console.log(`🚀 Initializing Milkyway App [${this.instanceId}]...`);
     this.profileName = await this.selectInstanceProfile();
     await this.initializeDatabase();
     this.createMainWindow();
     this.setupIPC();
-    console.log('✅ Milkyway App initialized successfully');
+    console.log(`✅ Milkyway App initialized [${this.instanceId}] profile: ${this.profileName}`);
   }
 
   async selectInstanceProfile() {
@@ -667,7 +746,7 @@ class FireKirinApp {
       defaultId: 0,
       title: '🎯 Milkyway - Select Profile',
       message: 'Choose which profile to use',
-      detail: 'Each profile has separate accounts.\nYou can run multiple instances with different profiles.',
+      detail: `Instance: ${this.instanceId}\nEach profile has separate accounts.\nYou can run multiple instances with different profiles.`,
       noLink: true
     });
 
@@ -695,13 +774,12 @@ class FireKirinApp {
     } catch (error) {
       console.log('No existing profiles found');
     }
-    return ['Profile_1', 'Profile_2', 'Profile_3'];
+    return ['Profile_1', 'Profile_2', 'Profile_3', 'Profile_4'];
   }
 
   async createNewProfile() {
     const profileNumber = Math.floor(Math.random() * 10000);
     const defaultName = `Profile_${profileNumber}`;
-
     const result = await dialog.showMessageBox(null, {
       type: 'question',
       buttons: ['Use Default', 'Cancel'],
@@ -710,23 +788,17 @@ class FireKirinApp {
       message: 'Create new profile?',
       detail: `New profile name: ${defaultName}\n\nClick "Use Default" to create this profile.`
     });
-
     return result.response === 0 ? defaultName : 'Profile_1';
   }
 
   async initializeDatabase() {
-    console.log(`📁 Initializing database for profile: ${this.profileName}...`);
+    console.log(`📁 Initializing database for profile: ${this.profileName} [${this.instanceId}]`);
     this.db = new Database(this.profileName);
     await this.db.init();
-    this.initializeProcessorForBetManagement();
+    this.initializeProcessor();
   }
 
-  // FIX 3: Processor initialization now removes all previous listeners
-  // before adding new ones. The old code added bet listeners here AND
-  // processing listeners in setupProcessorEventListeners(), with no
-  // deduplication. When the window was re-shown or processing restarted,
-  // both sets could accumulate, causing duplicate events and memory leaks.
-  initializeProcessorForBetManagement() {
+  initializeProcessor() {
     if (this.processor) {
       this.processor.removeAllListeners();
       this._processingListenersAttached = false;
@@ -734,21 +806,17 @@ class FireKirinApp {
 
     this.processor = new RouletteProcessor(this.db);
 
-    // Attach bet-specific listeners immediately
-    this.processor.on('betConfigChanged', (data) => {
-      this._sendToWindow('bet:configChanged', data);
-    });
-    this.processor.on('betUpdate', (data) => {
-      this._sendToWindow('bet:update', data);
-    });
-    this.processor.on('betError', (data) => {
-      this._sendToWindow('bet:error', data);
-    });
+    // Pass instance metadata to processor so it can stagger relative to others
+    this.processor.instanceId = this.instanceId;
+    this.processor.globalCoordinator = GlobalSocketCoordinator;
 
-    console.log('🎯 Bet processor initialized');
+    this.processor.on('betConfigChanged', (data) => this._sendToWindow('bet:configChanged', data));
+    this.processor.on('betUpdate', (data) => this._sendToWindow('bet:update', data));
+    this.processor.on('betError', (data) => this._sendToWindow('bet:error', data));
+
+    console.log(`🎯 Processor initialized [${this.instanceId}]`);
   }
 
-  // Helper: safely send to window if it still exists
   _sendToWindow(channel, data) {
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.send(channel, data);
@@ -756,7 +824,7 @@ class FireKirinApp {
   }
 
   createMainWindow() {
-    console.log('🖥️ Creating main window...');
+    console.log(`🖥️ Creating main window [${this.instanceId}]...`);
 
     this.mainWindow = new BrowserWindow({
       width: 1200,
@@ -767,70 +835,102 @@ class FireKirinApp {
         nodeIntegration: false,
         contextIsolation: true,
         preload: path.join(__dirname, 'preload.js'),
-        enableRemoteModule: false,
+        enableRemoteModule: false
       },
       title: `Milkyway - ${this.profileName}`,
       show: false
     });
 
     const isDev = !app.isPackaged;
-    this.mainWindow.loadFile(path.join(__dirname, 'index.html'));
 
-    if (!isDev) {
-      this.mainWindow.setMenu(null);
-    }
+    // Register a synchronous IPC handler so the preload can fetch this
+    // window's instanceId before contextBridge.exposeInMainWorld() runs.
+    // Using ipcMain.on (not handle) because preload uses sendSync.
+    // We store the handler reference so we can remove it after first use
+    // — one response per window is all that's needed.
+    const syncChannel = 'preload:getInstanceId';
+    const syncHandler = (event) => {
+      // Only answer if the request comes from THIS window's webContents
+      if (event.sender === this.mainWindow.webContents) {
+        event.returnValue = this.instanceId;
+      }
+    };
+    ipcMain.on(syncChannel, syncHandler);
+    // Clean up after the window is destroyed
+    this.mainWindow.once('closed', () => {
+      ipcMain.removeListener(syncChannel, syncHandler);
+    });
+
+    this.mainWindow.loadFile(path.join(__dirname, 'index.html'));
+    if (!isDev) this.mainWindow.setMenu(null);
 
     this.mainWindow.once('ready-to-show', () => {
-      console.log('✅ Window ready to show');
       this.mainWindow.show();
       this.initializeFirebase();
-      if (isDev) {
-        this.mainWindow.webContents.openDevTools();
-      }
+      if (isDev) this.mainWindow.webContents.openDevTools();
     });
 
     this.mainWindow.on('closed', () => {
-      console.log('🔴 Main window closed');
+      console.log(`🔴 Window closed [${this.instanceId}]`);
+      unregisterInstanceHandlers(this.instanceId);
+      activeInstances.delete(this.instanceId);
       this.mainWindow = null;
-      if (this.processor) {
-        this.processor.stopProcessing();
-      }
-      if (this.db) {
-        this.db.close();
-      }
+      if (this.processor) this.processor.stopProcessing();
+      if (this.db) this.db.close();
     });
   }
 
   async initializeFirebase() {
     try {
       this.userManager = new MainUserManager(this.mainWindow);
-      console.log('✅ Firebase UserManager initialized');
+      console.log(`✅ Firebase UserManager initialized [${this.instanceId}]`);
     } catch (error) {
-      console.error('❌ Firebase initialization failed:', error);
+      console.error(`❌ Firebase initialization failed [${this.instanceId}]:`, error);
     }
   }
 
   setupIPC() {
-    console.log('🔌 Setting up IPC handlers...');
+    console.log(`🔌 Setting up IPC handlers [${this.instanceId}]...`);
+
+    // Bootstrap: renderer calls this generic channel with no prefix to learn its instanceId
+    // This is the ONLY global (non-namespaced) handler per instance
+    const bootstrapChannel = `bootstrap:instanceId:${this.instanceId}`;
+    try { ipcMain.removeHandler(bootstrapChannel); } catch (_) {}
+    ipcMain.handle(bootstrapChannel, () => ({
+      instanceId: this.instanceId,
+      profileName: this.profileName
+    }));
+
+    // All other handlers are namespaced
+    this.setupProfileIPC();
     this.setupUserManagementIPC();
     this.setupAccountManagementIPC();
     this.setupProcessingIPC();
-    this.setupProfileIPC();
     this.setupBetManagementIPC();
-    console.log('✅ IPC handlers setup completed');
+
+    // Tell the renderer which instanceId to use (send after window is ready)
+    this.mainWindow.webContents.once('did-finish-load', () => {
+      this._sendToWindow('app:instanceId', {
+        instanceId: this.instanceId,
+        profileName: this.profileName
+      });
+    });
+
+    console.log(`✅ IPC handlers setup completed [${this.instanceId}]`);
+  }
+
+  h(channel, handler) {
+    // Shorthand: register a namespaced handler for this instance
+    registerInstanceHandler(this.instanceId, channel, handler);
   }
 
   setupProfileIPC() {
-    safeHandle('profile:getCurrent', async () => {
-      return { profileName: this.profileName };
-    });
-    safeHandle('profile:getAll', async () => {
-      return { profiles: this.getExistingProfiles() };
-    });
+    this.h('profile:getCurrent', async () => ({ profileName: this.profileName }));
+    this.h('profile:getAll', async () => ({ profiles: this.getExistingProfiles() }));
   }
 
   setupUserManagementIPC() {
-    safeHandle('user-management:initialize', async () => {
+    this.h('user-management:initialize', async () => {
       try {
         if (!this.db) throw new Error('Database not initialized');
         return { success: true, message: 'User management ready' };
@@ -839,18 +939,16 @@ class FireKirinApp {
       }
     });
 
-    safeHandle('user-management:getCurrentUser', async () => {
+    this.h('user-management:getCurrentUser', async () => {
       try {
-        if (this.userManager?.currentUser) {
-          return { success: true, user: this.userManager.currentUser };
-        }
+        if (this.userManager?.currentUser) return { success: true, user: this.userManager.currentUser };
         return { success: true, user: null };
       } catch (error) {
         return { success: false, error: error.message };
       }
     });
 
-    safeHandle('user-management:register', async (event, email, password) => {
+    this.h('user-management:register', async (event, email, password) => {
       try {
         if (!this.userManager) throw new Error('User manager not initialized');
         return await this.userManager.registerUser(email, password);
@@ -859,7 +957,7 @@ class FireKirinApp {
       }
     });
 
-    safeHandle('user-management:login', async (event, email, password) => {
+    this.h('user-management:login', async (event, email, password) => {
       try {
         if (!this.userManager) throw new Error('User manager not initialized');
         return await this.userManager.loginUser(email, password);
@@ -870,71 +968,47 @@ class FireKirinApp {
   }
 
   setupAccountManagementIPC() {
-    safeHandle('accounts:getAll', async () => {
-      return await this.db.getAllAccounts();
-    });
+    this.h('accounts:getAll', async () => this.db.getAllAccounts());
 
-    safeHandle('accounts:add', async (event, account) => {
+    this.h('accounts:add', async (event, account) => {
       if (account.password && !account.password.match(/^[a-f0-9]{32}$/)) {
         account.password = crypto.createHash('md5').update(account.password).digest('hex');
       }
       return await this.db.addAccount(account);
     });
 
-    safeHandle('accounts:addBulk', async (event, accounts) => {
-      const accountsWithMD5 = accounts.map(account => ({
-        ...account,
-        password: crypto.createHash('md5').update(account.password).digest('hex')
+    this.h('accounts:addBulk', async (event, accounts) => {
+      const withMD5 = accounts.map(a => ({
+        ...a,
+        password: crypto.createHash('md5').update(a.password).digest('hex')
       }));
-      return await this.db.addBulkAccounts(accountsWithMD5);
+      return await this.db.addBulkAccounts(withMD5);
     });
 
-    safeHandle('accounts:update', async (event, account) => {
-      return await this.db.updateAccount(account);
-    });
-
-    safeHandle('accounts:delete', async (event, id) => {
-      return await this.db.deleteAccount(id);
-    });
-
-    safeHandle('accounts:deleteMultiple', async (event, ids) => {
-      return await this.db.deleteMultipleAccounts(ids);
-    });
+    this.h('accounts:update', async (event, account) => this.db.updateAccount(account));
+    this.h('accounts:delete', async (event, id) => this.db.deleteAccount(id));
+    this.h('accounts:deleteMultiple', async (event, ids) => this.db.deleteMultipleAccounts(ids));
   }
 
   setupProcessingIPC() {
-    safeHandle('processing:start', async (event, accountIds, repetitions = 1) => {
+    this.h('processing:start', async (event, accountIds, repetitions = 1) => {
       try {
-        if (!this.processor) {
-          this.initializeProcessorForBetManagement();
-        }
-
-        // FIX 4: Use instance flag instead of listener count check.
-        // The old processorHasEventListeners() returned true as soon as
-        // bet listeners were attached, so processing listeners were NEVER
-        // registered. This meant status/terminal/progress events were
-        // emitted by the processor but never forwarded to the renderer.
-        if (!this._processingListenersAttached) {
-          this.setupProcessorEventListeners();
-        }
-
+        if (!this.processor) this.initializeProcessor();
+        if (!this._processingListenersAttached) this.setupProcessorEventListeners();
         const result = await this.processor.startProcessing(accountIds, repetitions);
         return result;
       } catch (error) {
-        console.error('❌ Error starting processing:', error);
+        console.error(`❌ Error starting processing [${this.instanceId}]:`, error);
         return { success: false, message: error.message };
       }
     });
 
-    safeHandle('processing:stop', async () => {
-      if (this.processor) {
-        await this.processor.stopProcessing();
-        return true;
-      }
+    this.h('processing:stop', async () => {
+      if (this.processor) { await this.processor.stopProcessing(); return true; }
       return false;
     });
 
-    safeHandle('processing:getStatus', async () => {
+    this.h('processing:getStatus', async () => {
       return this.processor ? this.processor.getStatus?.() ?? { running: false } : { running: false };
     });
   }
@@ -942,16 +1016,13 @@ class FireKirinApp {
   setupProcessorEventListeners() {
     if (!this.processor) return;
 
-    // FIX 5: Remove any stale processing listeners before attaching fresh ones.
-    // Without this, calling startProcessing twice (e.g. after stop+start)
-    // doubles up terminal/progress events, flooding the renderer.
     const processingEvents = [
       'status', 'terminal', 'progress', 'completed',
       'cycleUpdate', 'cycleStart', 'cycleComplete', 'cycleProgress'
     ];
     processingEvents.forEach(evt => this.processor.removeAllListeners(evt));
 
-    // Re-attach bet listeners since removeAllListeners cleared them too
+    // Re-attach bet listeners (cleared above)
     this.processor.on('betConfigChanged', (data) => this._sendToWindow('bet:configChanged', data));
     this.processor.on('betUpdate', (data) => this._sendToWindow('bet:update', data));
     this.processor.on('betError', (data) => this._sendToWindow('bet:error', data));
@@ -967,83 +1038,53 @@ class FireKirinApp {
     this.processor.on('cycleProgress', (data) => this._sendToWindow('processing:cycleProgress', data));
 
     this._processingListenersAttached = true;
-    console.log('✅ Processor event listeners attached');
+    console.log(`✅ Processor event listeners attached [${this.instanceId}]`);
   }
 
   setupBetManagementIPC() {
-    console.log('🔌 Setting up bet management IPC handlers...');
-
-    safeHandle('bet:setAmount', async (event, amount) => {
+    this.h('bet:setAmount', async (event, amount) => {
       try {
-        if (!this.processor) this.initializeProcessorForBetManagement();
+        if (!this.processor) this.initializeProcessor();
         const success = this.processor.handleBetChange(amount);
-        return {
-          success,
-          message: success ? `Bet amount set to ${amount}` : 'Failed to set bet amount',
-          newAmount: amount,
-          config: this.processor.getBetConfig()
-        };
-      } catch (error) {
-        return { success: false, message: error.message };
-      }
+        return { success, message: success ? `Bet set to ${amount}` : 'Failed', newAmount: amount, config: this.processor.getBetConfig() };
+      } catch (error) { return { success: false, message: error.message }; }
     });
 
-    safeHandle('bet:reset', async () => {
+    this.h('bet:reset', async () => {
       try {
-        if (!this.processor) this.initializeProcessorForBetManagement();
+        if (!this.processor) this.initializeProcessor();
         const defaultBet = this.processor.resetToDefaultBet();
-        return {
-          success: true,
-          message: 'Bet reset to default',
-          defaultBet,
-          config: this.processor.getBetConfig()
-        };
-      } catch (error) {
-        return { success: false, message: error.message };
-      }
+        return { success: true, defaultBet, config: this.processor.getBetConfig() };
+      } catch (error) { return { success: false, message: error.message }; }
     });
 
-    safeHandle('bet:getConfig', async () => {
+    this.h('bet:getConfig', async () => {
       try {
-        if (!this.processor) this.initializeProcessorForBetManagement();
+        if (!this.processor) this.initializeProcessor();
         return { success: true, config: this.processor.getBetConfig() };
-      } catch (error) {
-        return { success: false, message: error.message };
-      }
+      } catch (error) { return { success: false, message: error.message }; }
     });
 
-    safeHandle('bet:updateConfig', async (event, config) => {
+    this.h('bet:updateConfig', async (event, config) => {
       try {
-        if (!this.processor) this.initializeProcessorForBetManagement();
+        if (!this.processor) this.initializeProcessor();
         const success = this.processor.updateBetConfig(config);
-        return {
-          success,
-          message: success ? 'Bet configuration updated' : 'Failed to update configuration',
-          config: this.processor.getBetConfig()
-        };
-      } catch (error) {
-        return { success: false, message: error.message };
-      }
+        return { success, config: this.processor.getBetConfig() };
+      } catch (error) { return { success: false, message: error.message }; }
     });
 
-    safeHandle('bet:getCurrent', async () => {
+    this.h('bet:getCurrent', async () => {
       try {
-        if (!this.processor) this.initializeProcessorForBetManagement();
-        return {
-          success: true,
-          currentBet: this.processor.getCurrentBetAmount(),
-          config: this.processor.getBetConfig()
-        };
-      } catch (error) {
-        return { success: false, message: error.message };
-      }
+        if (!this.processor) this.initializeProcessor();
+        return { success: true, currentBet: this.processor.getCurrentBetAmount(), config: this.processor.getBetConfig() };
+      } catch (error) { return { success: false, message: error.message }; }
     });
-
-    console.log('✅ Bet management IPC handlers setup completed');
   }
 }
 
-// App initialization
+// ---------------------------------------------------------------------------
+// App lifecycle
+// ---------------------------------------------------------------------------
 app.whenReady().then(() => {
   const fireKirinApp = new FireKirinApp();
   fireKirinApp.init().catch(error => {
@@ -1052,15 +1093,10 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('activate', () => {
-  // FIX 6: On macOS 'activate' (dock click), only create a new instance if
-  // no windows exist. The old code always created a new FireKirinApp(),
-  // re-registering all IPC handlers and causing the "second handler" crash.
   if (BrowserWindow.getAllWindows().length === 0) {
     const fireKirinApp = new FireKirinApp();
     fireKirinApp.init().catch(error => {
@@ -1078,5 +1114,5 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('💥 Unhandled Rejection:', promise, 'reason:', reason);
 });
